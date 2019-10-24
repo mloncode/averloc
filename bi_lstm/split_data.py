@@ -18,7 +18,7 @@ def process_method_name(name):
 
 def process_AST(ast):
 	global ast_dict, ast_dict_file
-	ast = ast.replace('_',' ').replace('-',' ').strip()
+	ast = ast.replace('_',' ').strip()
 	ast = re.sub('[0-9]+', '', ast)
 	ast = ast.lower()
 	ast_list = ast.split(' ')
