@@ -172,7 +172,57 @@ class Model:
                 train_op = optimizer.apply_gradients(zip(clipped_gradients, params))
 
             self.saver = tf.train.Saver(max_to_keep=10)
-            
+        ##################################end of build training graph###########################
+        
+        ############################building eval graph#########################################
+        eval_target_index = tf.placeholder(tf.int32, [None, None])
+        eval_target_lengths = tf.placeholder(tf.int64, [None,])
+        eval_path_source_indices = tf.placeholder(tf.int32, [None, 200, 5])
+        eval_node_indices = tf.placeholder(tf.int32, [None, 200, 9])
+        eval_path_target_indices = tf.placeholder(tf.int32, [None, 200, 5])
+        eval_valid_context_mask = tf.placeholder(tf.float32, [None, 200])
+        eval_path_source_lengths = tf.placeholder(tf.int32, [None, 200])
+        eval_path_lengths = tf.placeholder(tf.int32, [None, 200])
+        eval_path_target_lengths = tf.placeholder(tf.int32, [None, 200])
+
+        with tf.variable_scope('model', reuse=self.get_should_reuse_variables()):
+            eval_subtoken_vocab = tf.get_variable('SUBTOKENS_VOCAB',
+                                             shape=(self.subtoken_vocab_size, self.config.EMBEDDINGS_SIZE),
+                                             dtype=tf.float32, trainable=False)
+            eval_target_words_vocab = tf.get_variable('TARGET_WORDS_VOCAB',
+                                                 shape=(self.target_vocab_size, self.config.EMBEDDINGS_SIZE),
+                                                 dtype=tf.float32, trainable=False)
+            eval_nodes_vocab = tf.get_variable('NODES_VOCAB',
+                                          shape=(self.nodes_vocab_size, self.config.EMBEDDINGS_SIZE),
+                                          dtype=tf.float32, trainable=False)
+
+            eval_batched_contexts = self.compute_contexts(subtoken_vocab=eval_subtoken_vocab, nodes_vocab=eval_nodes_vocab,
+                                                     source_input=eval_path_source_indices, nodes_input=eval_node_indices,
+                                                     target_input=eval_path_target_indices,
+                                                     valid_mask=eval_valid_context_mask,
+                                                     path_source_lengths=eval_path_source_lengths,
+                                                     path_lengths=eval_path_lengths, path_target_lengths=eval_path_target_lengths, is_evaluating=True)
+
+            eval_batch_size = tf.shape(eval_target_index)[0]
+            #print("batch size is "+str(batch_size)
+            eval_outputs, eval_final_states = self.decode_outputs(target_words_vocab=eval_target_words_vocab,
+                                                        target_input=eval_target_index, batch_size=eval_batch_size,
+                                                        batched_contexts=eval_batched_contexts,
+                                                        valid_mask=eval_valid_context_mask, is_evaluating=False, dropout=0)
+
+
+            eval_logits = eval_outputs.rnn_output  # (batch, max_output_length, dim * 2 + rnn_size)
+            #file_name = "file://eval_training"+str(count)+".log"
+            #file_name1 = "file://eval_training"+str(count+1)+".log"
+            #p_op1 = tf.print(tf.shape(target_index), output_stream=file_name, summarize=-1)
+            #p_op2 = tf.print(tf.shape(logits), output_stream=file_name1, summarize=-1)
+            #print(logits)
+            #print(target_index)
+            eval_crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=eval_target_index, logits=eval_logits)
+            eval_target_words_nonzero = tf.sequence_mask(eval_target_lengths + 1,
+                                                    maxlen=self.config.MAX_TARGET_PARTS + 1, dtype=tf.float32)
+            eval_graph_loss = tf.reduce_sum(eval_crossent * eval_target_words_nonzero) / tf.to_float(eval_batch_size)
+        ############################end of building eval graph##################################    
             
 
         self.queue_thread = reader.Reader(subtoken_to_index=self.subtoken_to_index,
@@ -182,6 +232,16 @@ class Model:
                                           epoch = 0)
             
         #input_tensors_data = self.queue_thread.get_output()
+     #   for batch_id in range(self.config.BATCHES):
+      #      for transf in range(self.config.TRANSFS):
+       #         if os.path.exists(self.config.TRAIN_DIR+"/"+str(transf)+"/"+str(batch_id)+".train.c2s"):
+        #            print(batch_id, transf)
+         #           self.eval_queues[batch_id][transf] = reader.Reader(subtoken_to_index=self.subtoken_to_index,
+          #                                                             node_to_index=self.node_to_index,
+           #                                                            target_to_index=self.target_to_index,
+            #                                                           config=self.config, adv_training = True, is_evaluating=True, 
+             #                                                          adv_transf = transf, batch_id = batch_id)
+                    
         
         self.print_hyperparams()
         print('Number of trainable params:',
@@ -198,19 +258,56 @@ class Model:
         
         for iteration in range(1, (self.config.NUM_EPOCHS // self.config.SAVE_EVERY_EPOCHS) + 1):
             open(self.config.TRAIN_PATH+str(iteration)+".train.c2s",'w').close()
-            print("start evaluation")   
-            for i in range(self.config.BATCHES):
+            print("start evaluation")
+            a_time = time.time() 
+            for batch_id in range(self.config.BATCHES):
+                print(time.time()-a_time)
+                a_time = time.time()
             #for i in range(10):
                 worst_transf = 0
                 worst_loss = 0.0
-                for j in range(self.config.TRANSFS):
-                    eval_loss = self.evaluate_training(batch_id=i, transf=j)
+                for transf in range(self.config.TRANSFS):
+                    egval_queue = None
+                    if not os.path.exists(self.config.TRAIN_DIR+"/"+str(transf)+"/"+str(batch_id)+".train.c2s"):
+                        print('Path not found')
+                        eval_loss = 0.0
+                    else:
+                        eval_batch_num = 0
+                        eval_sum_loss = 0.0
+                        a_time = time.time()
+                        eval_queue = reader.Reader(subtoken_to_index=self.subtoken_to_index,
+                                                                       node_to_index=self.node_to_index,
+                                                                       target_to_index=self.target_to_index,
+                                                                       config=self.config, adv_training = True, is_evaluating=True, 
+                                                                       adv_transf = transf, batch_id = batch_id)
+                        print('time1',time.time()-a_time)
+                        a_time = time.time()
+                        eval_input_tensors_data = eval_queue.get_output()
+                        eval_queue.reset(self.sess)
+                        
+                        print('time11',time.time()-a_time)
+                        try:
+                            while True:
+                                eval_batch_num += 1
+                                a_time = time.time()
+                                eval_input_tensors = self.sess.run(eval_input_tensors_data)
+                                eval_curr_loss = self.sess.run(eval_graph_loss, feed_dict={eval_target_index: eval_input_tensors[reader.TARGET_INDEX_KEY], eval_target_lengths: eval_input_tensors[reader.TARGET_LENGTH_KEY], eval_path_source_indices: eval_input_tensors[reader.PATH_SOURCE_INDICES_KEY], eval_node_indices: eval_input_tensors[reader.NODE_INDICES_KEY], eval_path_target_indices: eval_input_tensors[reader.PATH_TARGET_INDICES_KEY],  eval_valid_context_mask: eval_input_tensors[reader.VALID_CONTEXT_MASK_KEY], eval_path_source_lengths: eval_input_tensors[reader.PATH_SOURCE_LENGTHS_KEY], eval_path_lengths: eval_input_tensors[reader.PATH_LENGTHS_KEY], eval_path_target_lengths: eval_input_tensors[reader.PATH_TARGET_LENGTHS_KEY]})
+                                eval_sum_loss += eval_curr_loss
+                                print('time2',time.time()-a_time)
+                                
+                        except tf.errors.OutOfRangeError:
+                            eval_loss = eval_sum_loss/float(eval_batch_num)
+                            print(eval_loss)
+                    print('time3',time.time()-a_time)
                     if eval_loss > worst_loss:
                         worst_loss = eval_loss
-                        worst_transf = j
-                print("finish eval "+str(i)+"th batch")
-                append_file(self.config.TRAIN_DIR+"/"+str(worst_transf)+"/"+str(i)+".train.c2s", self.config.TRAIN_PATH+str(iteration)+".train.c2s")
-                print("append "+self.config.TRAIN_DIR+"/"+str(worst_transf)+"/"+str(i)+".train.c2s"+" to "+ self.config.TRAIN_PATH+str(iteration)+".train.c2s")
+                        worst_transf = transf
+                a_time = time.time()
+                append_file(self.config.TRAIN_DIR+"/"+str(worst_transf)+"/"+str(batch_id)+".train.c2s", self.config.TRAIN_PATH+str(iteration)+".train.c2s")
+                print('time4',time.time()-a_time)
+                print("append "+self.config.TRAIN_DIR+"/"+str(worst_transf)+"/"+str(batch_id)+".train.c2s"+" to "+ self.config.TRAIN_PATH+str(iteration)+".train.c2s")
+            
+            
             self.queue_thread = reader.Reader(subtoken_to_index=self.subtoken_to_index,
                                           node_to_index=self.node_to_index,
                                           target_to_index=self.target_to_index,
@@ -296,64 +393,8 @@ class Model:
     
     
     
-    def build_eval_graph(self, input_tensors):
-        target_index = input_tensors[reader.TARGET_INDEX_KEY]
-        target_lengths = input_tensors[reader.TARGET_LENGTH_KEY]
-        path_source_indices = input_tensors[reader.PATH_SOURCE_INDICES_KEY]
-        node_indices = input_tensors[reader.NODE_INDICES_KEY]
-        path_target_indices = input_tensors[reader.PATH_TARGET_INDICES_KEY]
-        valid_context_mask = input_tensors[reader.VALID_CONTEXT_MASK_KEY]
-        path_source_lengths = input_tensors[reader.PATH_SOURCE_LENGTHS_KEY]
-        path_lengths = input_tensors[reader.PATH_LENGTHS_KEY]
-        path_target_lengths = input_tensors[reader.PATH_TARGET_LENGTHS_KEY]
-
-        with tf.variable_scope('model', reuse=self.get_should_reuse_variables()):
-            subtoken_vocab = tf.get_variable('SUBTOKENS_VOCAB',
-                                             shape=(self.subtoken_vocab_size, self.config.EMBEDDINGS_SIZE),
-                                             dtype=tf.float32, trainable=False)
-            target_words_vocab = tf.get_variable('TARGET_WORDS_VOCAB',
-                                                 shape=(self.target_vocab_size, self.config.EMBEDDINGS_SIZE),
-                                                 dtype=tf.float32, trainable=False)
-            nodes_vocab = tf.get_variable('NODES_VOCAB',
-                                          shape=(self.nodes_vocab_size, self.config.EMBEDDINGS_SIZE),
-                                          dtype=tf.float32, trainable=False)
-
-            batched_contexts = self.compute_contexts(subtoken_vocab=subtoken_vocab, nodes_vocab=nodes_vocab,
-                                                     source_input=path_source_indices, nodes_input=node_indices,
-                                                     target_input=path_target_indices,
-                                                     valid_mask=valid_context_mask,
-                                                     path_source_lengths=path_source_lengths,
-                                                     path_lengths=path_lengths, path_target_lengths=path_target_lengths, is_evaluating=True)
-
-            batch_size = tf.shape(target_index)[0]
-            #print("batch size is "+str(batch_size)
-            outputs, final_states = self.decode_outputs(target_words_vocab=target_words_vocab,
-                                                        target_input=target_index, batch_size=batch_size,
-                                                        batched_contexts=batched_contexts,
-                                                        valid_mask=valid_context_mask, is_evaluating=False, dropout=0)
-
-
-            logits = outputs.rnn_output  # (batch, max_output_length, dim * 2 + rnn_size)
-            #file_name = "file://eval_training"+str(count)+".log"
-            #file_name1 = "file://eval_training"+str(count+1)+".log"
-            #p_op1 = tf.print(tf.shape(target_index), output_stream=file_name, summarize=-1)
-            #p_op2 = tf.print(tf.shape(logits), output_stream=file_name1, summarize=-1)
-            #print(logits)
-            #print(target_index)
-            crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=target_index, logits=logits)
-            target_words_nonzero = tf.sequence_mask(target_lengths + 1,
-                                                    maxlen=self.config.MAX_TARGET_PARTS + 1, dtype=tf.float32)
-            loss = tf.reduce_sum(crossent * target_words_nonzero) / tf.to_float(batch_size)
-            
-           
-
-            
-        return loss#, p_op1, p_op2
-    
     def evaluate_training(self, batch_id, transf):
         sum_loss = 0.0
-        #p1_op = None
-        #p2_op = None
         batch_num = 0
         if not os.path.exists(self.config.TRAIN_DIR+"/"+str(transf)+"/"+str(batch_id)+".train.c2s"):
             return 0.0
